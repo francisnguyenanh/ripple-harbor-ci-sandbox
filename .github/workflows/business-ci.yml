@@ -1,0 +1,65 @@
+# Business CI (D-CI-2 verification, TEMPORARY): the pull request's head is checked against the accepted business policy by the Ripple tool, read from the private
+# Ripple-Final repository at a PINNED commit through a read-only deploy key. The PR content is only read as data (never executed); `pull_request` (not
+# `pull_request_target`) means a fork's PR receives no secret and fails closed at the tool checkout. Exit 0 aligned -> success; 2 drift / 3 incomplete -> failure.
+name: business-ci
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: business-ci
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TOOL_SHA: ce6af80d94ebf1308e2a4039425a68c59b4dd8ed
+    steps:
+      - name: Sandbox pull request (data only)
+        uses: actions/checkout@v4
+        with:
+          path: sandbox
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+      - name: Ripple tool at the pinned commit (read-only deploy key)
+        uses: actions/checkout@v4
+        with:
+          repository: francisnguyenanh/Ripple-Final
+          ref: ${{ env.TOOL_SHA }}
+          ssh-key: ${{ secrets.RIPPLE_TOOL_DEPLOY_KEY }}
+          path: tool
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install the tool's pinned dependencies
+        run: python -m pip install -r tool/requirements.txt
+      - name: Business check
+        working-directory: tool
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          test "$(git rev-parse HEAD)" = "$TOOL_SHA"
+          python - <<'PY'
+          import json, pathlib
+          from core.change_intelligence.v2 import business_ci as ci
+          rules = json.loads(pathlib.Path("tests/fixtures/final_knowledge_loop/expected_knowledge.json").read_text(encoding="utf-8"))["observed_rules"]
+          policy = {"snapshot_id": "accepted-fixture", "business_revision": 1, "rules": rules}
+          mapping = {"profile": ci.PROFILE, "repo_id": "ripple-harbor-ci-sandbox", "policy_hash": ci.policy_hash(policy), "files": {"approval.yaml": "config/approval.yaml"}}
+          pathlib.Path("/tmp/policy.json").write_text(json.dumps(policy), encoding="utf-8")
+          pathlib.Path("/tmp/mapping.json").write_text(json.dumps(mapping), encoding="utf-8")
+          PY
+          BASE=$(git -C ../sandbox merge-base "origin/$BASE_REF" "$HEAD_SHA")
+          set +e
+          python -m tools.business_ci.check --repo ../sandbox --repo-id ripple-harbor-ci-sandbox --base "$BASE" --head "$HEAD_SHA" \
+            --policy /tmp/policy.json --mapping /tmp/mapping.json --out /tmp/business_ci_report.json
+          rc=$?
+          set -e
+          echo "business_ci_exit=$rc base=$BASE head=$HEAD_SHA tool=$TOOL_SHA" | tee -a "$GITHUB_STEP_SUMMARY"
+          cat /tmp/business_ci_report.json | head -c 4000 >> "$GITHUB_STEP_SUMMARY" || true
+          exit $rc
